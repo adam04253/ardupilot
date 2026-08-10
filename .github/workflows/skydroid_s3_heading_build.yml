@@ -1,4 +1,4 @@
-name: SkyDroid S3 NOVA heading factory-match v5
+name: SkyDroid S3 factory NOVA exact v6
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Patch SkyDroid S3 legacy FIX_ANGLE parameter
+      - name: Add SkyDroid legacy GPS compatibility parameters
         shell: bash
         run: |
           python3 - <<'PY'
@@ -27,7 +27,7 @@ jobs:
           hp = Path('libraries/AP_GPS/AP_GPS.h')
           h = hp.read_text()
           old = '''    AP_Int16 _driver_options;\n    AP_Int8 _primary;\n'''
-          new = '''    AP_Int16 _driver_options;\n    // SkyDroid factory firmware legacy parameter used to rotate NOVA HEADINGB into vehicle yaw.\n    AP_Int16 _fix_angle;\n    AP_Int8 _primary;\n'''
+          new = '''    AP_Int16 _driver_options;\n    // Legacy SkyDroid S3 GPS parameters recovered from factory firmware.\n    AP_Int16 _fix_angle;\n    AP_Int8  _ac_gps;\n    AP_Int32 _ac_bd;\n    AP_Int8  _mk43_en;\n    AP_Int8  _m100_en;\n    AP_Int8 _primary;\n'''
           if old not in h:
               raise SystemExit('AP_GPS.h parameter marker not found')
           h = h.replace(old, new, 1)
@@ -36,14 +36,14 @@ jobs:
           cp = Path('libraries/AP_GPS/AP_GPS.cpp')
           c = cp.read_text()
           marker = '''    // @Group: 1_\n    // @Path: AP_GPS_Params.cpp\n'''
-          param = '''    // @Param: _FIX_ANGLE\n    // @DisplayName: SkyDroid NOVA heading alignment\n    // @Description: Angle subtracted from NOVA HEADINGB heading before it is used as vehicle GPS yaw. Factory SkyDroid S3 firmware defaults this to 90 degrees.\n    // @Units: deg\n    // @Range: -360 360\n    // @Increment: 1\n    // @User: Advanced\n    AP_GROUPINFO("_FIX_ANGLE", 34, AP_GPS, _fix_angle, 90),\n\n'''
+          params = '''    // SkyDroid factory compatibility parameters.  These names and types\n    // are present in the original S3 firmware GPS AP_Param table.\n    AP_GROUPINFO("_FIX_ANGLE", 34, AP_GPS, _fix_angle, 90),\n    AP_GROUPINFO("_AC_GPS",    35, AP_GPS, _ac_gps, 0),\n    AP_GROUPINFO("_AC_BD",     36, AP_GPS, _ac_bd, 115200),\n    // Factory GroupInfo default is 0, but the SkyDroid S3 board default\n    // overrides GPS_MK43_EN to 1. Match the effective S3 default here.\n    AP_GROUPINFO("_MK43_EN",   37, AP_GPS, _mk43_en, 1),\n    AP_GROUPINFO("_M100_EN",   38, AP_GPS, _m100_en, 1),\n\n'''
           if marker not in c:
               raise SystemExit('AP_GPS.cpp var_info marker not found')
-          c = c.replace(marker, param + marker, 1)
+          c = c.replace(marker, params + marker, 1)
           cp.write_text(c)
           PY
 
-      - name: Patch AP_GPS_NOVA for SkyDroid S3 dual-antenna HEADINGB
+      - name: Patch NOVA to exact SkyDroid S3 factory heading behavior
         shell: bash
         run: |
           python3 - <<'PY'
@@ -51,41 +51,37 @@ jobs:
 
           hp = Path('libraries/AP_GPS/AP_GPS_NOVA.h')
           h = hp.read_text()
-          h = h.replace('static const char* const _initialisation_blob[4];',
-                        'static const char* const _initialisation_blob[5];')
           marker = '    static const uint8_t NOVA_BESTVEL = 99;\n'
-          heading = '''    // SkyDroid S3 dual-antenna NOVA-compatible HEADINGB (message 971)\n    static const uint16_t NOVA_HEADING = 971;\n    struct PACKED heading\n    {\n        uint32_t solstat;\n        uint32_t postype;\n        float length;\n        float heading_deg;\n        float pitch_deg;\n        float reserved;\n        float heading_stddev_deg;\n        float pitch_stddev_deg;\n        uint8_t stnid[4];\n        uint8_t svstracked;\n        uint8_t svsused;\n        uint8_t svsobs;\n        uint8_t svsmultfreq;\n        uint8_t solsource;\n        uint8_t extsolstat;\n        uint8_t galbeidoumask;\n        uint8_t gpsglomask;\n    };\n\n'''
+          heading = '''    // SkyDroid S3 NOVA HEADINGB, recovered from factory firmware.\n    static const uint16_t NOVA_HEADING = 971;\n    struct PACKED heading\n    {\n        uint32_t solstat;\n        uint32_t postype;\n        float length;\n        float heading_deg;\n        float pitch_deg;\n        float reserved;\n        float heading_stddev_deg;\n        float pitch_stddev_deg;\n        uint8_t tail[12];\n    };\n\n'''
           if marker not in h:
-              raise SystemExit('header marker not found')
+              raise SystemExit('NOVA header marker not found')
           h = h.replace(marker, heading + marker, 1)
           h = h.replace('        psrdop psrdopu;\n        uint8_t bytes[256];',
-                        '        psrdop psrdopu;\n        heading headingu;\n        uint8_t bytes[256];')
+                        '        psrdop psrdopu;\n        heading headingu;\n        uint8_t bytes[256];', 1)
           hp.write_text(h)
 
           cp = Path('libraries/AP_GPS/AP_GPS_NOVA.cpp')
           c = cp.read_text()
-          c = c.replace('const char* const AP_GPS_NOVA::_initialisation_blob[4] {',
-                        'const char* const AP_GPS_NOVA::_initialisation_blob[5] {')
-          c = c.replace('    "log bestvelb ontime 0.2 0 nohold\\r\\n",\n    "log psrdopb ontime 0.2 0 nohold\\r\\n",',
-                        '    "log bestvelb ontime 0.2 0 nohold\\r\\n",\n    "log headingb ontime 0.2 0 nohold\\r\\n",\n    "log psrdopb ontime 0.2 0 nohold\\r\\n",')
 
-          # Factory S3 is normally used with GPS_AUTO_CONFIG=0. Keep the receiver's
-          # RTK configuration untouched and request HEADINGB only in that mode.
+          # Replace upstream NOVA startup with the byte-for-byte command sequence
+          # sent by the factory SkyDroid S3 NOVA constructor.  The factory image
+          # sends these commands unconditionally after driver construction.
           ctor = '''    if (gps._auto_config != AP_GPS::GPS_AUTO_CONFIG_DISABLE) {\n        const char *init_str = _initialisation_blob[0];\n        const char *init_str1 = _initialisation_blob[1];\n\n        port->write((const uint8_t*)init_str, strlen(init_str));\n        port->write((const uint8_t*)init_str1, strlen(init_str1));\n    }\n'''
-          ctor_new = '''    if (gps._auto_config != AP_GPS::GPS_AUTO_CONFIG_DISABLE) {\n        const char *init_str = _initialisation_blob[0];\n        const char *init_str1 = _initialisation_blob[1];\n\n        port->write((const uint8_t*)init_str, strlen(init_str));\n        port->write((const uint8_t*)init_str1, strlen(init_str1));\n    } else {\n        static const char heading_log[] = "log headingb ontime 0.2 0 nohold\\r\\n";\n        port->write((const uint8_t*)heading_log, strlen(heading_log));\n    }\n'''
+          ctor_new = '''    static const char skydroid_factory_nova_setup[] =\n        "\\r\\n\\r\\nunlogall\\r\\n"\n        "mode rover\\r\\n"\n        "config com1 115200\\r\\n"\n        "log bestposb ontime 0.2 0 nohold\\r\\n"\n        "log bestvelb ontime 0.2 0 nohold\\r\\n"\n        "log headingb ontime 0.2 0 nohold\\r\\n"\n        "log psrdopb onchanged\\r\\n"\n        "log psrdopb ontime 0.2\\r\\n"\n        "log psrdopb\\r\\n"\n        "log psrposb ontime 0.2\\r\\n"\n        "log psrposb\\r\\n"\n        "saveconfig\\r\\n";\n    port->write((const uint8_t*)skydroid_factory_nova_setup,\n                strlen(skydroid_factory_nova_setup));\n\n    // Prevent the upstream NOVA init blob from being sent later by read();\n    // the factory sequence above fully replaces it.\n    _init_blob_index = ARRAY_SIZE(_initialisation_blob);\n'''
           if ctor not in c:
-              raise SystemExit('constructor marker not found')
+              raise SystemExit('NOVA constructor marker not found')
           c = c.replace(ctor, ctor_new, 1)
 
           marker2 = '    case NOVA_PSRDOP: {  // psrdop\n'
-          heading_case = '''    case NOVA_HEADING: {\n        if (nova_msg.header.nova_headeru.messagelength < sizeof(heading)) {\n            state.have_gps_yaw = false;\n            return false;\n        }\n\n        const heading &h = nova_msg.data.headingu;\n        const uint32_t now = AP_HAL::millis();\n        state.gps_yaw_configured = true;\n\n        // Reverse engineering of the factory S3 image confirmed the NOVA layout:\n        // +8 baseline length, +12 heading, +16 pitch, +24/+28 standard deviations.\n        // The factory code also rejects poor heading solutions and requires >14 sats.\n        const bool baseline_ok = isfinite(h.length) && h.length >= 0.10f && h.length <= 1.00f;\n        const bool heading_ok = isfinite(h.heading_deg) && h.heading_deg >= 0.0f && h.heading_deg < 360.0f;\n        const bool pitch_ok = isfinite(h.pitch_deg) && fabsf(h.pitch_deg) <= 90.0f;\n        const bool accuracy_ok = isfinite(h.heading_stddev_deg) &&\n                                 h.heading_stddev_deg > 0.0f && h.heading_stddev_deg <= 3.0f;\n        const bool sats_ok = state.num_sats > 14;\n        const bool valid = h.solstat == 0 && baseline_ok && heading_ok && pitch_ok && accuracy_ok && sats_ok;\n\n        if (!valid) {\n            state.have_gps_yaw = false;\n            state.have_gps_yaw_accuracy = false;\n            return false;\n        }\n\n        // This is the key behaviour found in the original SkyDroid firmware:\n        // vehicle yaw = HEADINGB heading - GPS_FIX_ANGLE (factory default 90 deg).\n        const float yaw_deg = wrap_360(h.heading_deg - float(gps._fix_angle.get()));\n        state.gps_yaw = yaw_deg;\n        state.gps_yaw_time_ms = now;\n        state.have_gps_yaw = true;\n        state.gps_yaw_accuracy = h.heading_stddev_deg;\n        state.have_gps_yaw_accuracy = true;\n\n        state.relPosHeading = yaw_deg;\n        state.relPosLength = h.length;\n        state.relPosD = h.length * sinf(radians(-h.pitch_deg));\n        state.accHeading = h.heading_stddev_deg;\n        state.relposheading_ts = now;\n        return false;\n    }\n'''
+          heading_case = '''    case NOVA_HEADING: {\n        // The factory S3 parser handles message 971 as HEADINGB.\n        if (nova_msg.header.nova_headeru.messagelength < 28) {\n            return false;\n        }\n\n        const heading &h = nova_msg.data.headingu;\n\n        // Exact factory gating recovered from Thumb-2 code:\n        //   current GPS fix must be better than 2D;\n        //   satellites used must be > 14;\n        //   HEADINGB heading standard deviation must be > 0 and <= 3 deg.\n        // The factory code does NOT gate yaw on HEADINGB solstat, baseline\n        // length or pitch.\n        if (state.status <= AP_GPS_FixType::FIX_2D) {\n            return false;\n        }\n\n        const bool valid = state.num_sats > 14 &&\n                           isfinite(h.heading_stddev_deg) &&\n                           h.heading_stddev_deg > 0.0f &&\n                           h.heading_stddev_deg <= 3.0f;\n        if (!valid) {\n            state.have_gps_yaw = false;\n            state.have_gps_yaw_accuracy = false;\n            return false;\n        }\n\n        // Exact factory yaw transformation:\n        // GPS yaw = HEADINGB heading - GPS_FIX_ANGLE, then wrap 0..360.\n        const float yaw_deg = wrap_360(h.heading_deg - float(gps._fix_angle.get()));\n        state.gps_yaw = yaw_deg;\n        state.gps_yaw_time_ms = state.last_gps_time_ms;\n        state.gps_yaw_accuracy = h.heading_stddev_deg;\n        state.have_gps_yaw_accuracy = true;\n        state.have_gps_yaw = true;\n        state.gps_yaw_configured = true;\n        return false;\n    }\n'''
           if marker2 not in c:
-              raise SystemExit('process marker not found')
+              raise SystemExit('NOVA process marker not found')
           c = c.replace(marker2, heading_case + marker2, 1)
           cp.write_text(c)
           PY
 
-          grep -n "FIX_ANGLE\|NOVA_HEADING\|headingb\|gps_yaw\|relPosHeading" libraries/AP_GPS/AP_GPS.{h,cpp} libraries/AP_GPS/AP_GPS_NOVA.{h,cpp}
+          grep -n "FIX_ANGLE\|AC_GPS\|AC_BD\|MK43_EN\|M100_EN\|NOVA_HEADING\|headingb\|skydroid_factory_nova_setup\|gps_yaw" \
+            libraries/AP_GPS/AP_GPS.{h,cpp} libraries/AP_GPS/AP_GPS_NOVA.{h,cpp}
 
       - name: Build Rover for SkyDroid-S3
         shell: bash
@@ -106,6 +102,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: skydroid-s3-rover-nova-heading-factory-match-v5
+          name: skydroid-s3-rover-factory-nova-exact-v6
           path: firmware/
           if-no-files-found: error
