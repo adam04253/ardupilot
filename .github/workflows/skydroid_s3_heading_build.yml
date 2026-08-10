@@ -1,4 +1,4 @@
-name: SkyDroid S3 NOVA heading diagnostic v3
+name: SkyDroid S3 NOVA heading final v4
 
 on:
   workflow_dispatch:
@@ -18,7 +18,7 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Patch AP_GPS_NOVA with HEADINGB diagnostics
+      - name: Patch AP_GPS_NOVA for SkyDroid S3 dual-antenna HEADINGB
         shell: bash
         run: |
           python3 - <<'PY'
@@ -29,7 +29,7 @@ jobs:
           h = h.replace('static const char* const _initialisation_blob[4];',
                         'static const char* const _initialisation_blob[5];')
           marker = '    static const uint8_t NOVA_BESTVEL = 99;\n'
-          heading = '''    // SkyDroid S3 dual-antenna HEADINGB diagnostic support\n    static const uint16_t NOVA_HEADING = 971;\n    struct PACKED heading\n    {\n        uint32_t solstat;\n        uint32_t postype;\n        float f08;\n        float f12;\n        float f16;\n        float f20;\n        float f24;\n        float f28;\n        uint8_t tail[12];\n    };\n\n'''
+          heading = '''    // SkyDroid S3 dual-antenna NOVA-compatible HEADINGB (message 971)\n    static const uint16_t NOVA_HEADING = 971;\n    struct PACKED heading\n    {\n        uint32_t solstat;\n        uint32_t postype;\n        float length;\n        float heading_deg;\n        float pitch_deg;\n        float reserved;\n        float heading_stddev_deg;\n        float pitch_stddev_deg;\n        uint8_t stnid[4];\n        uint8_t svstracked;\n        uint8_t svsused;\n        uint8_t svsobs;\n        uint8_t svsmultfreq;\n        uint8_t solsource;\n        uint8_t extsolstat;\n        uint8_t galbeidoumask;\n        uint8_t gpsglomask;\n    };\n\n'''
           if marker not in h:
               raise SystemExit('header marker not found')
           h = h.replace(marker, heading + marker, 1)
@@ -39,13 +39,13 @@ jobs:
 
           cp = Path('libraries/AP_GPS/AP_GPS_NOVA.cpp')
           c = cp.read_text()
-          c = c.replace('#include <AP_Logger/AP_Logger.h>',
-                        '#include <AP_Logger/AP_Logger.h>\n#include <GCS_MAVLink/GCS.h>')
           c = c.replace('const char* const AP_GPS_NOVA::_initialisation_blob[4] {',
                         'const char* const AP_GPS_NOVA::_initialisation_blob[5] {')
           c = c.replace('    "log bestvelb ontime 0.2 0 nohold\\r\\n",\n    "log psrdopb ontime 0.2 0 nohold\\r\\n",',
                         '    "log bestvelb ontime 0.2 0 nohold\\r\\n",\n    "log headingb ontime 0.2 0 nohold\\r\\n",\n    "log psrdopb ontime 0.2 0 nohold\\r\\n",')
 
+          # S3 is normally used with GPS_AUTO_CONFIG=0. In that mode keep the
+          # receiver's factory RTK configuration untouched and request HEADINGB only.
           ctor = '''    if (gps._auto_config != AP_GPS::GPS_AUTO_CONFIG_DISABLE) {\n        const char *init_str = _initialisation_blob[0];\n        const char *init_str1 = _initialisation_blob[1];\n\n        port->write((const uint8_t*)init_str, strlen(init_str));\n        port->write((const uint8_t*)init_str1, strlen(init_str1));\n    }\n'''
           ctor_new = '''    if (gps._auto_config != AP_GPS::GPS_AUTO_CONFIG_DISABLE) {\n        const char *init_str = _initialisation_blob[0];\n        const char *init_str1 = _initialisation_blob[1];\n\n        port->write((const uint8_t*)init_str, strlen(init_str));\n        port->write((const uint8_t*)init_str1, strlen(init_str1));\n    } else {\n        static const char heading_log[] = "log headingb ontime 0.2 0 nohold\\r\\n";\n        port->write((const uint8_t*)heading_log, strlen(heading_log));\n    }\n'''
           if ctor not in c:
@@ -53,14 +53,14 @@ jobs:
           c = c.replace(ctor, ctor_new, 1)
 
           marker2 = '    case NOVA_PSRDOP: {  // psrdop\n'
-          heading_case = '''    case NOVA_HEADING: {\n        if (nova_msg.header.nova_headeru.messagelength < 32) {\n            state.have_gps_yaw = false;\n            return false;\n        }\n        const heading &h = nova_msg.data.headingu;\n        const uint32_t now = AP_HAL::millis();\n\n        // Keep the previous candidate in GPS_RAW_INT yaw for continuity.\n        state.gps_yaw_configured = true;\n        if (h.solstat == 0 && isfinite(h.f12) && h.f12 >= 0.0f && h.f12 < 360.0f) {\n            state.gps_yaw = wrap_360(h.f12);\n            state.gps_yaw_time_ms = now;\n            state.have_gps_yaw = true;\n        } else {\n            state.have_gps_yaw = false;\n        }\n\n        // Once per second print the raw float candidates from payload offsets\n        // 8,12,16,20,24,28 so we can identify the real heading field.\n        static uint32_t last_diag_ms;\n        if (now - last_diag_ms >= 1000) {\n            last_diag_ms = now;\n            GCS *g = GCS::get_singleton();\n            if (g != nullptr) {\n                g->send_text(MAV_SEVERITY_INFO,\n                             "HB 8=%.2f 12=%.2f 16=%.2f",\n                             (double)h.f08, (double)h.f12, (double)h.f16);\n                g->send_text(MAV_SEVERITY_INFO,\n                             "HB 20=%.2f 24=%.2f 28=%.2f",\n                             (double)h.f20, (double)h.f24, (double)h.f28);\n            }\n        }\n        return false;\n    }\n'''
+          heading_case = '''    case NOVA_HEADING: {\n        if (nova_msg.header.nova_headeru.messagelength < sizeof(heading)) {\n            state.have_gps_yaw = false;\n            return false;\n        }\n\n        const heading &h = nova_msg.data.headingu;\n        const uint32_t now = AP_HAL::millis();\n        state.gps_yaw_configured = true;\n\n        // The S3 diagnostics confirmed the standard NOVA HEADING layout:\n        // +8 baseline length, +12 heading, +16 pitch, +24/+28 standard deviations.\n        // Reject transient/invalid solutions so bogus HEADINGB values are never fed to EKF.\n        const bool baseline_ok = isfinite(h.length) && h.length >= 0.10f && h.length <= 1.00f;\n        const bool heading_ok = isfinite(h.heading_deg) && h.heading_deg >= 0.0f && h.heading_deg < 360.0f;\n        const bool pitch_ok = isfinite(h.pitch_deg) && fabsf(h.pitch_deg) <= 90.0f;\n        const bool accuracy_ok = isfinite(h.heading_stddev_deg) &&\n                                 h.heading_stddev_deg >= 0.0f && h.heading_stddev_deg <= 10.0f;\n        const bool valid = h.solstat == 0 && baseline_ok && heading_ok && pitch_ok && accuracy_ok;\n\n        if (!valid) {\n            state.have_gps_yaw = false;\n            state.have_gps_yaw_accuracy = false;\n            return false;\n        }\n\n        state.gps_yaw = wrap_360(h.heading_deg);\n        state.gps_yaw_time_ms = now;\n        state.have_gps_yaw = true;\n        state.gps_yaw_accuracy = h.heading_stddev_deg;\n        state.have_gps_yaw_accuracy = true;\n\n        // Populate relative-position fields as well; these are useful to the\n        // moving-baseline/heading consumers in ArduPilot.\n        state.relPosHeading = h.heading_deg;\n        state.relPosLength = h.length;\n        state.relPosD = h.length * sinf(radians(-h.pitch_deg));\n        state.relposheading_ts = now;\n        return false;\n    }\n'''
           if marker2 not in c:
               raise SystemExit('process marker not found')
           c = c.replace(marker2, heading_case + marker2, 1)
           cp.write_text(c)
           PY
 
-          grep -n "NOVA_HEADING\|headingb\|HB 8=" libraries/AP_GPS/AP_GPS_NOVA.{h,cpp}
+          grep -n "NOVA_HEADING\|headingb\|gps_yaw\|relPosHeading" libraries/AP_GPS/AP_GPS_NOVA.{h,cpp}
 
       - name: Build Rover for SkyDroid-S3
         shell: bash
@@ -81,6 +81,6 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: skydroid-s3-rover-nova-heading-v3-diagnostic
+          name: skydroid-s3-rover-nova-heading-final-v4
           path: firmware/
           if-no-files-found: error
